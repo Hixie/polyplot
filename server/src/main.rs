@@ -5,65 +5,78 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use futures_util::StreamExt; // defines split on WebSocketStream<tokio_native_tls::TlsStream<tokio::net::TcpStream>>
-use futures_util::TryStreamExt; // defines try_for_each on SplitStream<WebSocketStream<tokio_native_tls::TlsStream<tokio::net::TcpStream>>>
+use futures_util::sink::SinkExt; // for send
+use futures_util::stream::StreamExt; // for split
+use futures_util::stream::TryStreamExt; // for try_for_each
 
-type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<tungstenite::protocol::Message>>>>;
+type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<Result<String, ()>>>>>;
 
-// PLACEHOLDER CODE (copied from tutorial)
 async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsStream<tokio::net::TcpStream>, addr: std::net::SocketAddr) {
-    println!("Incoming TCP connection from: {}", addr);
+  println!("{}: Connecting...", addr);
 
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
-    println!("WebSocket connection established: {}", addr);
+  let ws_stream = tokio_tungstenite::accept_async(raw_stream)
+      .await
+      .expect("Error during the websocket handshake occurred");
+  println!("{}: Connection established.", addr);
 
-    // Insert the write part of this peer to the peer map.
-    let (tx, rx) = futures_channel::mpsc::unbounded();
-    peer_map.lock().unwrap().insert(addr, tx);
+  let (internal_tx, mut internal_rx) = futures_channel::mpsc::unbounded::<Result<String, ()>>();
+  peer_map.lock().unwrap().insert(addr, internal_tx);
 
-    let (outgoing, incoming) = ws_stream.split();
+  let (mut websocket_tx, websocket_rx) = ws_stream.split();
 
-    let broadcast_incoming = incoming.try_for_each(|msg| {
-        println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
+  let incoming_websocket_messages = websocket_rx.try_for_each(|message| {
+    match message {
+      tungstenite::protocol::Message::Text(payload) => {
+        println!("{}: \"{}\"", addr, payload);
         let peers = peer_map.lock().unwrap();
-
-        // We want to broadcast the message to everyone except ourselves.
-        let broadcast_recipients =
-            peers.iter().filter(|(peer_addr, _)| peer_addr != &&addr).map(|(_, ws_sink)| ws_sink);
-
-        for recp in broadcast_recipients {
-            recp.unbounded_send(msg.clone()).unwrap();
+        let peer_txs = peers.iter().filter(|(peer_addr, _peer_tx)| peer_addr != &&addr).map(|(_peer_addr, peer_tx)| peer_tx);
+        for peer_tx in peer_txs {
+          peer_tx.unbounded_send(Ok(payload.clone())).unwrap();
         }
+      },
+      tungstenite::protocol::Message::Close(payload) => {
+        match payload {
+          None => println!("{}: Disconnecting... (no data)", addr),
+          Some(data) => println!("{}: Disconnecting... ({}: {})", addr, data.code, data.reason),
+        }
+      },
+      _ => { } // binary, ping, and pong frames are ignored
+    }
+    futures_util::future::ok(())
+  });
 
-        futures_util::future::ok(())
-    });
+  let incoming_peer_messages = async move {
+    loop {
+      match internal_rx.next().await {
+        Some(message) => websocket_tx.send(tungstenite::protocol::Message::Text(message.unwrap().clone())).await.unwrap(),
+        None => break,
+      }
+    }
+    futures_util::future::ready(())
+  };
 
-    let receive_from_others = rx.map(Ok).forward(outgoing);
+  futures_util::pin_mut!(incoming_websocket_messages, incoming_peer_messages);
+  futures_util::future::select(incoming_websocket_messages, incoming_peer_messages).await;
 
-    futures_util::pin_mut!(broadcast_incoming, receive_from_others);
-    futures_util::future::select(broadcast_incoming, receive_from_others).await;
-
-    println!("{} disconnected", &addr);
-    peer_map.lock().unwrap().remove(&addr);
+  println!("{}: Disconnected.", &addr);
+  peer_map.lock().unwrap().remove(&addr);
 }
 
 #[derive(Clone)]
 struct Configuration {
-    pfx_filename: String,
-    server_address: String,
-    update_interval: core::time::Duration,
+  pfx_filename: String,
+  server_address: String,
+  update_interval: core::time::Duration,
 }
 
 async fn read_configuration() -> Configuration {
-    let configfile = fs::read_to_string("configuration").unwrap();
-    let lines: Vec<&str> = configfile.split('\n').collect();
-    Configuration{
-      pfx_filename: String::from(lines[0]),
-      server_address: String::from(lines[1]),
-      update_interval: core::time::Duration::from_secs(lines[2].parse().unwrap()),
-    }
+  let configfile = fs::read_to_string("configuration").unwrap();
+  let lines: Vec<&str> = configfile.split('\n').collect();
+  Configuration{
+    pfx_filename: String::from(lines[0]),
+    server_address: String::from(lines[1]),
+    update_interval: core::time::Duration::from_secs(lines[2].parse().unwrap()),
+  }
 }
 
 async fn prepare_acceptor(configuration: &Configuration) -> tokio_native_tls::TlsAcceptor {
