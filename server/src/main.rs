@@ -1,23 +1,17 @@
-use futures_channel::mpsc::UnboundedSender;
-use futures_channel::mpsc::unbounded;
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
-use native_tls::Identity;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::fs;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-//use tokio::io::AsyncRead;
-//use tokio::io::AsyncWrite;
-use tokio::net::TcpStream;
-use tungstenite::protocol::Message;
 
-type Tx = UnboundedSender<Message>;
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
+use futures_util::StreamExt; // defines split on WebSocketStream<tokio_native_tls::TlsStream<tokio::net::TcpStream>>
+use futures_util::TryStreamExt; // defines try_for_each on SplitStream<WebSocketStream<tokio_native_tls::TlsStream<tokio::net::TcpStream>>>
 
-async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsStream<TcpStream>, addr: SocketAddr) {
+type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<tungstenite::protocol::Message>>>>;
+
+// PLACEHOLDER CODE (copied from tutorial)
+async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsStream<tokio::net::TcpStream>, addr: std::net::SocketAddr) {
     println!("Incoming TCP connection from: {}", addr);
 
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
@@ -26,7 +20,7 @@ async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsS
     println!("WebSocket connection established: {}", addr);
 
     // Insert the write part of this peer to the peer map.
-    let (tx, rx) = unbounded();
+    let (tx, rx) = futures_channel::mpsc::unbounded();
     peer_map.lock().unwrap().insert(addr, tx);
 
     let (outgoing, incoming) = ws_stream.split();
@@ -43,13 +37,13 @@ async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsS
             recp.unbounded_send(msg.clone()).unwrap();
         }
 
-        future::ok(())
+        futures_util::future::ok(())
     });
 
     let receive_from_others = rx.map(Ok).forward(outgoing);
 
-    pin_mut!(broadcast_incoming, receive_from_others);
-    future::select(broadcast_incoming, receive_from_others).await;
+    futures_util::pin_mut!(broadcast_incoming, receive_from_others);
+    futures_util::future::select(broadcast_incoming, receive_from_others).await;
 
     println!("{} disconnected", &addr);
     peer_map.lock().unwrap().remove(&addr);
@@ -78,39 +72,42 @@ async fn prepare_acceptor(configuration: &Configuration) -> tokio_native_tls::Tl
   let mut file = File::open(&configuration.pfx_filename).unwrap();
   let mut pkcs12 = vec![];
   file.read_to_end(&mut pkcs12).unwrap();
-  let pkcs12 = Identity::from_pkcs12(&pkcs12, "").unwrap();
+  let pkcs12 = native_tls::Identity::from_pkcs12(&pkcs12, "").unwrap();
   tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::builder(pkcs12).build().unwrap())
 }
+
+// TODO: cleaner error handling
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
   let configuration = Arc::new(read_configuration().await);
+  let state = PeerMap::new(Mutex::new(HashMap::new()));
+  let listener = tokio::net::TcpListener::bind(&configuration.server_address).await.unwrap();
 
   let acceptor: Arc<Mutex<tokio_native_tls::TlsAcceptor>> = Arc::new(Mutex::new(prepare_acceptor(&configuration).await));
-
-  let configuration1: Arc<Configuration> = configuration.clone();
-  let acceptor1: Arc<Mutex<tokio_native_tls::TlsAcceptor>> = acceptor.clone();
-  tokio::spawn(async move {
-    let duration = configuration1.update_interval;
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
-    loop {
-      interval.tick().await;
-      let new_acceptor = prepare_acceptor(&configuration1).await;
-      *(acceptor1.lock().unwrap()) = new_acceptor;
+  tokio::spawn({
+    let configuration: Arc<Configuration> = configuration.clone();
+    let acceptor: Arc<Mutex<tokio_native_tls::TlsAcceptor>> = acceptor.clone();
+    async move {
+      let duration = configuration.update_interval;
+      let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
+      loop {
+        interval.tick().await;
+        let new_acceptor = prepare_acceptor(&configuration).await;
+        *(acceptor.lock().unwrap()) = new_acceptor;
+      }
     }
   });
 
-  let state = PeerMap::new(Mutex::new(HashMap::new()));
-
-  // Create the event loop and TCP listener we'll accept connections on.
-  let listener = tokio::net::TcpListener::bind(&configuration.server_address).await?;
-  tokio::spawn(async move {
-    // Let's spawn the handling of each connection in a separate task.
+  tokio::spawn({
     println!("Listening on: {}", configuration.server_address);
-    loop {
-      let (stream, addr) = listener.accept().await.unwrap();
-      let current_acceptor = acceptor.clone().lock().unwrap().clone();
-      tokio::spawn(handle_connection(state.clone(), current_acceptor.accept(stream).await.unwrap(), addr));
+    let acceptor: Arc<Mutex<tokio_native_tls::TlsAcceptor>> = acceptor.clone();
+    async move {
+      loop {
+        let (stream, addr) = listener.accept().await.unwrap();
+        let current_acceptor = acceptor.clone().lock().unwrap().clone();
+        tokio::spawn(handle_connection(state.clone(), current_acceptor.accept(stream).await.unwrap(), addr));
+      }
     }
   });
 
