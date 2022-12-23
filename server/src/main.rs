@@ -46,17 +46,14 @@ async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsS
   });
 
   let incoming_peer_messages = async move {
-    loop {
-      match internal_rx.next().await {
-        Some(message) => websocket_tx.send(tungstenite::protocol::Message::Text(message.unwrap().clone())).await.unwrap(),
-        None => break,
-      }
-    }
-    futures_util::future::ready(())
+    while let Some(message) = internal_rx.next().await {
+      websocket_tx.send(tungstenite::protocol::Message::Text(message.unwrap().clone())).await.unwrap();
+    };
+    Ok(())
   };
 
   futures_util::pin_mut!(incoming_websocket_messages, incoming_peer_messages);
-  futures_util::future::select(incoming_websocket_messages, incoming_peer_messages).await;
+  futures_util::future::try_join(incoming_websocket_messages, incoming_peer_messages).await.unwrap();
 
   println!("{}: Disconnected.", &addr);
   peer_map.lock().unwrap().remove(&addr);
