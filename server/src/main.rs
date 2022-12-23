@@ -9,6 +9,7 @@ use futures_util::sink::SinkExt; // for send
 use futures_util::stream::StreamExt; // for split
 use futures_util::stream::TryStreamExt; // for try_for_each
 use futures_util::future::TryFutureExt; // for and_then
+use futures_util::FutureExt;
 
 type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<Result<String, ()>>>>>;
 
@@ -43,10 +44,9 @@ async fn handle_connection(peer_map: PeerMap, raw_stream: tokio_native_tls::TlsS
       },
       _ => { } // binary, ping, and pong frames are ignored
     }
-    futures_util::future::ok(())
   });
 
-  let incoming_peer_messages = internal_rx.map(|message| {
+  let incoming_peer_messages = internal_rx.then(|message| async move {
     websocket_tx.send(tungstenite::protocol::Message::Text(message.unwrap().clone()))
   });
 
