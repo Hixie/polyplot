@@ -44,10 +44,35 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
         }
       },
       tungstenite::protocol::Message::Close(payload) => {
+        let reason: String;
         match payload {
-          None => println!("{}: Disconnecting... (no data)", addr),
-          Some(data) => println!("{}: Disconnecting... ({}: {})", addr, data.code, data.reason),
+          None => { reason = String::from("no reason provided"); },
+          Some(data) => {
+            if data.reason == "" {
+              reason = match data.code {
+                tungstenite::protocol::frame::coding::CloseCode::Normal => String::from("1000, client closed conection"),
+                tungstenite::protocol::frame::coding::CloseCode::Away => String::from("1001, client was terminated"),
+                tungstenite::protocol::frame::coding::CloseCode::Protocol => String::from("1002, server violated the protocol"),
+                tungstenite::protocol::frame::coding::CloseCode::Unsupported => String::from("1003, server used sent an unexpected data type"),
+                tungstenite::protocol::frame::coding::CloseCode::Status => String::from("no status received"),
+                tungstenite::protocol::frame::coding::CloseCode::Abnormal => String::from("no close frame received"),
+                tungstenite::protocol::frame::coding::CloseCode::Invalid => String::from("1007, server sent an erroneous payload"),
+                tungstenite::protocol::frame::coding::CloseCode::Policy => String::from("1008, server violated a client policy"),
+                tungstenite::protocol::frame::coding::CloseCode::Size => String::from("1009, payload too large for client"),
+                tungstenite::protocol::frame::coding::CloseCode::Extension => String::from("1010, expected extension unspecified by server"),
+                tungstenite::protocol::frame::coding::CloseCode::Error => String::from("1011, client suffered an internal error"),
+                // Restart is for servers to report that they are restarting.
+                // Again is for servers to report that they are overloaded.
+                // 1014 is for servers who are acting as a gateway or proxy and received an invalid response from the upstream server to report that failure.
+                // Tls is the internal code for "TLS handshake error", which is not relevant here since we do TLS separately.
+                _ => format!("{}, no reason provided", data.code),
+              };
+            } else {
+              reason = format!("{}: \"{}\"", data.code, data.reason);
+            }
+          }
         }
+        println!("{}: Disconnecting... ({})", addr, reason);
       },
       _ => { } // binary, ping, and pong frames are ignored
     }
@@ -58,11 +83,10 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
     while let Some(message) = internal_rx.next().await {
       websocket_tx.send(tungstenite::protocol::Message::Text(message.clone())).await.unwrap_or_default();
     };
-    Ok(())
   };
 
   futures_util::pin_mut!(incoming_websocket_messages, incoming_peer_messages);
-  futures_util::future::try_join(incoming_websocket_messages, incoming_peer_messages).await.unwrap_or_default();
+  futures_util::future::select(incoming_websocket_messages, incoming_peer_messages).await;
 
   println!("{}: Disconnected.", &addr);
   peer_map.lock().unwrap().remove(&addr);
