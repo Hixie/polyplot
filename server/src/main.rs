@@ -11,7 +11,15 @@ use futures_util::stream::TryStreamExt; // for try_for_each
 
 type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<String>>>>;
 
-async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_stream: tokio::net::TcpStream, acceptor: tokio_native_tls::TlsAcceptor) {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct TokenClaims {
+  pub email: String,
+  pub aud: String,
+  pub iss: String,
+  pub exp: u64,
+}
+
+async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_stream: tokio::net::TcpStream, acceptor: tokio_native_tls::TlsAcceptor, google_client_id: String) {
   println!("{}: Connecting...", addr);
 
   let tls_stream: Result<tokio_native_tls::TlsStream<tokio::net::TcpStream>, native_tls::Error> = acceptor.accept(raw_stream).await;
@@ -32,15 +40,45 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
   peer_map.lock().unwrap().insert(addr, internal_tx);
   println!("{}: Connection established.", addr);
 
-  let incoming_websocket_messages = websocket_rx.try_for_each(|message| {
+  let incoming_websocket_messages = websocket_rx.try_for_each(|message| async {
     match message {
       tungstenite::protocol::Message::Text(payload) => {
-        println!("{}: \"{}\"", addr, payload);
-        // Forward the message to every other peer.
-        let peers = peer_map.lock().unwrap();
-        let peer_txs = peers.iter().filter(|(peer_addr, _peer_tx)| peer_addr != &&addr).map(|(_peer_addr, peer_tx)| peer_tx);
-        for peer_tx in peer_txs {
-          peer_tx.unbounded_send(payload.clone()).unwrap_or_default();
+        let lines: Vec<&str> = payload.lines().collect();
+        if lines.len() < 1 {
+          println!("{}: invalid message", addr);
+          return Ok(());
+        }
+        match lines[0] {
+          "login" => {
+            if lines.len() < 3 {
+              println!("{}: invalid login message", addr);
+              return Ok(());
+            }
+            match lines[1] {
+              "google" => {
+                let jwt = lines[2];
+                let parser = jsonwebtoken_google::Parser::new(&google_client_id);
+                let claims = parser.parse::<TokenClaims>(jwt).await.unwrap();
+                println!("{}: login as {}", addr, claims.email);
+              },
+              _ => {
+                println!("{}: unsupported authentication provider {}", addr, lines[1]);
+                return Ok(());
+              }
+            }
+          }
+          "send" => {
+            // Forward the message to every other peer.
+            let peers = peer_map.lock().unwrap();
+            let peer_txs = peers.iter().filter(|(peer_addr, _peer_tx)| peer_addr != &&addr).map(|(_peer_addr, peer_tx)| peer_tx);
+            for peer_tx in peer_txs {
+              peer_tx.unbounded_send(format!("message\n{}\n{}", addr, lines[2..lines.len()-1].join("\n"))).unwrap_or_default();
+            }
+          }
+          _ => {
+            println!("{}: unknown message type \"{}\"", addr, lines[0]);
+            return Ok(());
+          }
         }
       },
       tungstenite::protocol::Message::Close(payload) => {
@@ -76,7 +114,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
       },
       _ => { } // binary, ping, and pong frames are ignored
     }
-    futures_util::future::ok(())
+    Ok(())
   });
 
   let incoming_peer_messages = async move {
@@ -98,32 +136,39 @@ struct Configuration {
   server_address: String,
   server_port: u16,
   update_interval: core::time::Duration,
+  google_client_id: String,
 }
 
 async fn read_configuration() -> Configuration {
-  let configfile = fs::read_to_string("configuration").unwrap();
+  let configfile = fs::read_to_string("configuration").expect("Cannot read configuration file. Polyplot should be executed from the directory that contains the \"configuration\" file.");
   let lines: Vec<&str> = configfile.split('\n').collect();
   Configuration{
     pfx_filename: String::from(lines[0]),
     server_address: String::from(lines[1]),
     server_port: lines[2].parse().expect("Port (line 3) was not an integer in the range 0..65535."),
     update_interval: core::time::Duration::from_secs(lines[3].parse().expect("Update interval (line 4) was not an integer (number of seconds).")),
+    google_client_id: lines[4].to_string(),
   }
 }
 
 async fn prepare_acceptor(configuration: &Configuration) -> tokio_native_tls::TlsAcceptor {
   // Read the private key and certificate.
   println!("Refreshing certificates...");
-  let mut file = File::open(&configuration.pfx_filename).unwrap();
+  let mut file = File::open(&configuration.pfx_filename)
+    .unwrap_or_else(|error| panic!("Cannot open certificates from \"{}\": {}", &configuration.pfx_filename, error));
   let mut pkcs12 = vec![];
-  file.read_to_end(&mut pkcs12).unwrap();
-  let pkcs12 = native_tls::Identity::from_pkcs12(&pkcs12, "").unwrap();
-  tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::builder(pkcs12).build().unwrap())
+  file.read_to_end(&mut pkcs12)
+    .unwrap_or_else(|error| panic!("Cannot read certificates from \"{}\": {}", &configuration.pfx_filename, error));
+  let pkcs12 = native_tls::Identity::from_pkcs12(&pkcs12, "")
+    .unwrap_or_else(|error| panic!("Cannot decode certificates from \"{}\": {}", &configuration.pfx_filename, error));
+  tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::builder(pkcs12).build()
+    .unwrap_or_else(|error| panic!("Cannot prepare TLS handshake protocol: {}", error)))
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
   let configuration = Arc::new(read_configuration().await);
+
   let state = PeerMap::new(Mutex::new(HashMap::new()));
   let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", configuration.server_port)).await.unwrap();
 
@@ -153,7 +198,7 @@ async fn main() -> std::io::Result<()> {
           continue;
         }
         let (stream, addr) = socket.unwrap();
-        tokio::spawn(handle_connection(state.clone(), addr, stream, acceptor.clone().lock().unwrap().clone()));
+        tokio::spawn(handle_connection(state.clone(), addr, stream, acceptor.clone().lock().unwrap().clone(), configuration.google_client_id.clone()));
       }
     }
   });

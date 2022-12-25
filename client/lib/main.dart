@@ -6,9 +6,10 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:web_socket_client/web_socket_client.dart';
 
 final GoogleSignIn googleSignIn = GoogleSignIn();
-final WebSocket server = WebSocket(Uri.parse('wss://polyplot.fun:1979'));
+late final WebSocket server;
 
 void main() {
+  server = WebSocket(Uri.parse('wss://polyplot.fun:1979'));
   runApp(const MyApp());
 }
 
@@ -46,7 +47,7 @@ class _HomePageState extends State<HomePage> {
           // googleSignIn.currentUser changed
           if (account != null) {
             googleSignIn.currentUser!.authentication.then((GoogleSignInAuthentication auth) {
-              server.send(auth.idToken);
+              server.send('login\ngoogle\n${auth.idToken}');
             });
           }
         });
