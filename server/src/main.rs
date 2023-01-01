@@ -12,12 +12,14 @@ use futures_util::stream::TryStreamExt; // for try_for_each
 type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<String>>>>;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct TokenClaims {
+struct TokenClaims {
   pub email: String,
   pub aud: String,
   pub iss: String,
   pub exp: u64,
 }
+
+static error_frame: tungstenite::protocol::Message = tungstenite::protocol::Message::Text("error".to_string());
 
 async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_stream: tokio::net::TcpStream, acceptor: tokio_native_tls::TlsAcceptor, google_client_id: String) {
   println!("{}: Connecting...", addr);
@@ -34,35 +36,47 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
     println!("{}: WebSocket handshake failed: {}", addr, error);
     return;
   }
-  let (mut websocket_tx, websocket_rx) = ws_stream.unwrap().split();
+  let (websocket_tx, websocket_rx) = ws_stream.unwrap().split();
+  let websocket_tx = Arc::new(Mutex::new(websocket_tx));
 
   let (internal_tx, mut internal_rx) = futures_channel::mpsc::unbounded::<String>();
   peer_map.lock().unwrap().insert(addr, internal_tx);
   println!("{}: Connection established.", addr);
 
+  let websocket_tx1 = websocket_tx.clone();
   let incoming_websocket_messages = websocket_rx.try_for_each(|message| async {
     match message {
       tungstenite::protocol::Message::Text(payload) => {
         let lines: Vec<&str> = payload.lines().collect();
         if lines.len() < 1 {
           println!("{}: invalid message", addr);
+          websocket_tx1.lock().unwrap().send(error_frame.clone());
           return Ok(());
         }
         match lines[0] {
           "login" => {
             if lines.len() < 3 {
               println!("{}: invalid login message", addr);
+              websocket_tx1.lock().unwrap().send(error_frame.clone());
               return Ok(());
             }
             match lines[1] {
               "google" => {
                 let jwt = lines[2];
                 let parser = jsonwebtoken_google::Parser::new(&google_client_id);
-                let claims = parser.parse::<TokenClaims>(jwt).await.unwrap();
+                let claims = parser.parse::<TokenClaims>(jwt).await;
+                if let Err(error) = claims {
+                  println!("{}: invalid login token, {:?}", addr, error);
+                  websocket_tx1.lock().unwrap().send(error_frame.clone());
+                  return Ok(());
+                }
+                let claims = claims.unwrap();
                 println!("{}: login as {}", addr, claims.email);
+                websocket_tx1.lock().unwrap().send(tungstenite::protocol::Message::Text("login".to_string()));
               },
               _ => {
                 println!("{}: unsupported authentication provider {}", addr, lines[1]);
+                websocket_tx1.lock().unwrap().send(error_frame.clone());
                 return Ok(());
               }
             }
@@ -77,6 +91,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
           }
           _ => {
             println!("{}: unknown message type \"{}\"", addr, lines[0]);
+            websocket_tx1.lock().unwrap().send(error_frame.clone());
             return Ok(());
           }
         }
@@ -117,9 +132,10 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
     Ok(())
   });
 
+  let websocket_tx2 = websocket_tx.clone();
   let incoming_peer_messages = async move {
     while let Some(message) = internal_rx.next().await {
-      websocket_tx.send(tungstenite::protocol::Message::Text(message.clone())).await.unwrap_or_default();
+      websocket_tx2.lock().unwrap().send(tungstenite::protocol::Message::Text(message.clone())).await.unwrap_or_default();
     };
   };
 

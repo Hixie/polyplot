@@ -47,7 +47,7 @@ class _HomePageState extends State<HomePage> {
           // googleSignIn.currentUser changed
           if (account != null) {
             googleSignIn.currentUser!.authentication.then((GoogleSignInAuthentication auth) {
-              server.send('login\ngoogle\n${auth.idToken}');
+              server.send('login\ngoogle\n${auth.idToken}x');
             });
           }
         });
