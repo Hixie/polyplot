@@ -13,10 +13,11 @@ type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::Un
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TokenClaims {
-  pub email: String,
-  pub aud: String,
-  pub iss: String,
-  pub exp: u64,
+  iss: String, // key
+  sub: String, // subkey
+  email: Option<String>,
+  name: Option<String>,
+  picture: Option<String>,
 }
 
 async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_stream: tokio::net::TcpStream, acceptor: tokio_native_tls::TlsAcceptor, google_client_id: String) {
@@ -69,7 +70,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
                   return Ok(());
                 }
                 let claims = claims.unwrap();
-                println!("{}: login as {}", addr, claims.email);
+                println!("{}: login {}#{} // e-mail {}, name {}, picture {}", addr, claims.iss, claims.sub, claims.email.unwrap_or_default(), claims.name.unwrap_or_default(), claims.picture.unwrap_or_default());
                 peer_map.lock().unwrap()[&addr].unbounded_send(tungstenite::protocol::Message::Text("login".to_string())).unwrap();
               },
               _ => {

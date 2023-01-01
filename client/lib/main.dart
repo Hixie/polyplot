@@ -1,82 +1,47 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_signin_button/flutter_signin_button.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:web_socket_client/web_socket_client.dart';
 
-final GoogleSignIn googleSignIn = GoogleSignIn();
-late final WebSocket server;
+import 'server.dart';
 
 void main() {
-  server = WebSocket(Uri.parse('wss://polyplot.fun:1979'));
-  server.messages.listen((Object? message) {
-    print('server says: $message');
-  });
-  runApp(const MyApp());
+  runApp(MyApp(server: Server()));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  const MyApp({super.key, required this.server});
+
+  final Server server;
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
+    return MaterialApp(
       title: 'Polyplot',
-      home: HomePage(title: 'Polyplot'),
+      home: HomePage(server: server),
     );
   }
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.title});
+  const HomePage({super.key, required this.server});
 
-  final String title;
+  final Server server;
 
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-
-  late final StreamSubscription _googleSignInSubscription;
-
-  @override
-  void initState() {
-    super.initState();
-    _googleSignInSubscription = googleSignIn.onCurrentUserChanged.listen(
-      (GoogleSignInAccount? account) {
-        setState(() {
-          // googleSignIn.currentUser changed
-          if (account != null) {
-            googleSignIn.currentUser!.authentication.then((GoogleSignInAuthentication auth) {
-              server.send('login\ngoogle\n${auth.idToken}');
-            });
-          }
-        });
-      },
-    );
-  }
-
-  @override
-  void dispose() {
-    _googleSignInSubscription.cancel();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.title),
-      ),
-      body: Center(
-        child: googleSignIn.currentUser == null ? SignInButton(
-          Buttons.Google,
-          onPressed: () {
-            googleSignIn.signIn();
-          },
-        ) : GoogleUserCircleAvatar(identity: googleSignIn.currentUser!),
+    return Center(
+      child: ValueListenableBuilder(
+        valueListenable: widget.server.account,
+        builder: (BuildContext context, GoogleSignInAccount? account, Widget? child) {
+          return account == null
+               ? SizedBox(height: 32.0, child: SignInButton(Buttons.Google, onPressed: widget.server.triggerSignIn))
+               : GoogleUserCircleAvatar(identity: account);
+        },
       ),
     );
   }
