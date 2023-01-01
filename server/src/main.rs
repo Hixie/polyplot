@@ -9,10 +9,10 @@ use futures_util::sink::SinkExt; // for send
 use futures_util::stream::StreamExt; // for split
 use futures_util::stream::TryStreamExt; // for try_for_each
 
-type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<String>>>>;
+type PeerMap = Arc<Mutex<HashMap<std::net::SocketAddr, futures_channel::mpsc::UnboundedSender<tungstenite::protocol::Message>>>>;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct TokenClaims {
+struct TokenClaims {
   pub email: String,
   pub aud: String,
   pub iss: String,
@@ -21,6 +21,8 @@ pub struct TokenClaims {
 
 async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_stream: tokio::net::TcpStream, acceptor: tokio_native_tls::TlsAcceptor, google_client_id: String) {
   println!("{}: Connecting...", addr);
+
+  let error_frame: tungstenite::protocol::Message = tungstenite::protocol::Message::Text("error".to_string());
 
   let tls_stream: Result<tokio_native_tls::TlsStream<tokio::net::TcpStream>, native_tls::Error> = acceptor.accept(raw_stream).await;
   if let Err(error) = tls_stream {
@@ -36,7 +38,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
   }
   let (mut websocket_tx, websocket_rx) = ws_stream.unwrap().split();
 
-  let (internal_tx, mut internal_rx) = futures_channel::mpsc::unbounded::<String>();
+  let (internal_tx, mut internal_rx) = futures_channel::mpsc::unbounded::<tungstenite::protocol::Message>();
   peer_map.lock().unwrap().insert(addr, internal_tx);
   println!("{}: Connection established.", addr);
 
@@ -46,23 +48,33 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
         let lines: Vec<&str> = payload.lines().collect();
         if lines.len() < 1 {
           println!("{}: invalid message", addr);
+          peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
           return Ok(());
         }
         match lines[0] {
           "login" => {
             if lines.len() < 3 {
               println!("{}: invalid login message", addr);
+              peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
               return Ok(());
             }
             match lines[1] {
               "google" => {
                 let jwt = lines[2];
                 let parser = jsonwebtoken_google::Parser::new(&google_client_id);
-                let claims = parser.parse::<TokenClaims>(jwt).await.unwrap();
+                let claims = parser.parse::<TokenClaims>(jwt).await;
+                if let Err(error) = claims {
+                  println!("{}: invalid login token, {:?}", addr, error);
+                  peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
+                  return Ok(());
+                }
+                let claims = claims.unwrap();
                 println!("{}: login as {}", addr, claims.email);
+                peer_map.lock().unwrap()[&addr].unbounded_send(tungstenite::protocol::Message::Text("login".to_string())).unwrap();
               },
               _ => {
                 println!("{}: unsupported authentication provider {}", addr, lines[1]);
+                peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
                 return Ok(());
               }
             }
@@ -72,11 +84,12 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
             let peers = peer_map.lock().unwrap();
             let peer_txs = peers.iter().filter(|(peer_addr, _peer_tx)| peer_addr != &&addr).map(|(_peer_addr, peer_tx)| peer_tx);
             for peer_tx in peer_txs {
-              peer_tx.unbounded_send(format!("message\n{}\n{}", addr, lines[2..lines.len()-1].join("\n"))).unwrap_or_default();
+              peer_tx.unbounded_send(tungstenite::protocol::Message::Text(format!("message\n{}\n{}", addr, lines[2..lines.len()-1].join("\n")))).unwrap_or_default();
             }
           }
           _ => {
             println!("{}: unknown message type \"{}\"", addr, lines[0]);
+            peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
             return Ok(());
           }
         }
@@ -119,7 +132,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
 
   let incoming_peer_messages = async move {
     while let Some(message) = internal_rx.next().await {
-      websocket_tx.send(tungstenite::protocol::Message::Text(message.clone())).await.unwrap_or_default();
+      websocket_tx.send(message).await.unwrap_or_default();
     };
   };
 

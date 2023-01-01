@@ -10,6 +10,9 @@ late final WebSocket server;
 
 void main() {
   server = WebSocket(Uri.parse('wss://polyplot.fun:1979'));
+  server.messages.listen((Object? message) {
+    print('server says: $message');
+  });
   runApp(const MyApp());
 }
 
