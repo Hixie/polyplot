@@ -48,7 +48,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
       tungstenite::protocol::Message::Text(payload) => {
         let lines: Vec<&str> = payload.lines().collect();
         if lines.len() < 1 {
-          println!("{}: invalid message", addr);
+          println!("{}: empty payload", addr);
           peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
           return Ok(());
         }
@@ -81,12 +81,21 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
             }
           }
           "send" => {
+            if lines.len() < 2 {
+              println!("{}: send message had empty payload", addr);
+              peer_map.lock().unwrap()[&addr].unbounded_send(error_frame.clone()).unwrap();
+              return Ok(());
+            }
             // Forward the message to every other peer.
+            let message = tungstenite::protocol::Message::Text(format!("message\n{}\n{}", addr, lines[1..lines.len()].join("\n")));
+            println!("{}: sending message to peers...", addr);
             let peers = peer_map.lock().unwrap();
             let peer_txs = peers.iter().filter(|(peer_addr, _peer_tx)| peer_addr != &&addr).map(|(_peer_addr, peer_tx)| peer_tx);
             for peer_tx in peer_txs {
-              peer_tx.unbounded_send(tungstenite::protocol::Message::Text(format!("message\n{}\n{}", addr, lines[2..lines.len()-1].join("\n")))).unwrap_or_default();
+              peer_tx.unbounded_send(message.clone()).unwrap_or_default();
             }
+            peers[&addr].unbounded_send(tungstenite::protocol::Message::Text("sent".to_string())).unwrap();
+            println!("{}: sent", addr);
           }
           _ => {
             println!("{}: unknown message type \"{}\"", addr, lines[0]);
