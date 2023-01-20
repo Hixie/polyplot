@@ -114,7 +114,7 @@ async fn handle_connection(peer_map: PeerMap, addr: std::net::SocketAddr, raw_st
                 tungstenite::protocol::frame::coding::CloseCode::Normal => String::from("1000, client closed conection"),
                 tungstenite::protocol::frame::coding::CloseCode::Away => String::from("1001, client was terminated"),
                 tungstenite::protocol::frame::coding::CloseCode::Protocol => String::from("1002, server violated the protocol"),
-                tungstenite::protocol::frame::coding::CloseCode::Unsupported => String::from("1003, server used sent an unexpected data type"),
+                tungstenite::protocol::frame::coding::CloseCode::Unsupported => String::from("1003, server sent an unexpected data type"),
                 tungstenite::protocol::frame::coding::CloseCode::Status => String::from("no status received"),
                 tungstenite::protocol::frame::coding::CloseCode::Abnormal => String::from("no close frame received"),
                 tungstenite::protocol::frame::coding::CloseCode::Invalid => String::from("1007, server sent an erroneous payload"),
